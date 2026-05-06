@@ -21,6 +21,9 @@ us-east-1 (primary)                    us-west-2 (DR)
 
 ## Components
 
+runbooks/
+├── full-cluster-restore.md   # 6-step DR procedure with RTO targets
+└── rds-restore.md            # RDS snapshot restore + secret update
 ```
 terraform/modules/s3-replication/
 ├── main.tf        # Replica bucket, IAM role, replication config on source bucket
