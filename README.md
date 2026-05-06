@@ -19,6 +19,9 @@ Lambda: rds-snapshot-copy
 
 ## Components
 
+runbooks/
+├── full-cluster-restore.md   # 6-step DR procedure with RTO targets
+└── rds-restore.md            # RDS snapshot restore + secret update
 ```
 lambda/rds-snapshot-copy/
 └── handler.py          # Python 3.12 Lambda — copy + cleanup logic
