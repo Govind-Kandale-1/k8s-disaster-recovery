@@ -1,57 +1,78 @@
-# k8s-disaster-recovery
+# Feature: S3 Cross-Region Replication
 
-Production-grade Disaster Recovery platform for Kubernetes on AWS.
-
-## What this project covers
-
-| Feature | Branch | Tools |
-|---------|--------|-------|
-| Velero backup + S3 backend | `feature/velero-backup-setup` | Velero, Helm, Terraform, IRSA |
-| Cross-region S3 replication | `feature/s3-cross-region-replication` | S3 CRR, IAM, Terraform |
-| RDS snapshot automation | `feature/rds-snapshot-automation` | Lambda, CloudWatch Events, Terraform |
-| Restore runbook automation | `feature/restore-runbook-automation` | Bash, Velero CLI, kubectl |
-| Automated DR drills | `feature/dr-drill-github-action` | GitHub Actions, k6, Bash |
-| RTO/RPO monitoring dashboard | `feature/rto-rpo-monitoring-dashboard` | Prometheus, Grafana, Alertmanager |
+Automatically replicates every Velero backup object from the primary S3 bucket (`us-east-1`) to a DR replica bucket (`us-west-2`) using S3 Cross-Region Replication (CRR). Backups are available in the DR region within seconds of being written.
 
 ## Architecture
 
 ```
-Primary Region (us-east-1)                DR Region (us-west-2)
-┌──────────────────────────┐              ┌──────────────────────────┐
-│  EKS Cluster             │              │  EKS Cluster (standby)   │
-│  ├── Velero              │──backups──►  │  ├── Velero              │
-│  │   ├── Hourly NS backup│              │  │   └── Restore target   │
-│  │   └── Daily full      │              │  └── Apps (restored)     │
-│  └── Apps                │              │                          │
-│                          │   S3 CRR     │                          │
-│  S3 (velero-primary)     │──────────►   │  S3 (velero-dr)          │
-│                          │              │                          │
-│  RDS                     │──snapshots►  │  RDS (restored)          │
-└──────────────────────────┘              └──────────────────────────┘
+us-east-1 (primary)                    us-west-2 (DR)
+┌────────────────────────┐              ┌────────────────────────┐
+│ velero-backups-primary │ ──── CRR ──► │ velero-backups-dr      │
+│ (STANDARD)             │              │ (STANDARD_IA)          │
+│ Versioning: enabled    │              │ Versioning: enabled    │
+│ SSE: AES256            │              │ SSE: AES256            │
+└────────────────────────┘              └────────────────────────┘
+         ▲
+   IAM replication role
+   (assumed by S3 service)
 ```
 
-## RTO / RPO Targets
+`STANDARD_IA` is used in the DR bucket to reduce storage costs — DR backups are accessed rarely (only during actual recovery).
 
-| Tier | RPO | RTO |
-|------|-----|-----|
-| Critical (prod) | 1 hour | 30 min |
-| Standard (staging) | 8 hours | 2 hours |
-| Dev | 24 hours | 4 hours |
+## Components
 
-## Quick Start
+```
+terraform/modules/s3-replication/
+├── main.tf        # Replica bucket, IAM role, replication config on source bucket
+├── variables.tf
+└── outputs.tf
+
+terraform/environments/dr/
+└── main.tf        # DR environment — reads primary state via remote_state
+```
+
+## Prerequisites
+
+- `feature/velero-backup-setup` applied first (provides source bucket ARN/ID)
+- Terraform remote state for `dr/primary` accessible
+- AWS credentials with permissions in both `us-east-1` and `us-west-2`
+
+## Deploy
 
 ```bash
-# 1. Bootstrap primary region
-cd terraform/environments/primary
-terraform init && terraform apply
-
-# 2. Bootstrap DR region
 cd terraform/environments/dr
-terraform init && terraform apply
-
-# 3. Apply Velero Kubernetes manifests
-kubectl apply -f kubernetes/velero/
-
-# 4. Trigger a manual DR drill
-.github/scripts/dr-drill/run-drill.sh --env staging --dry-run
+terraform init
+terraform apply
 ```
+
+Terraform reads the primary environment's remote state to obtain the source bucket ARN and ID automatically — no manual wiring needed.
+
+## Verify Replication
+
+After applying, upload a test object to the primary bucket and confirm it appears in the replica within ~60 seconds:
+
+```bash
+echo "test" | aws s3 cp - s3://<primary-bucket>/replication-test.txt
+aws s3 ls s3://<dr-bucket>/ --region us-west-2 | grep replication-test
+```
+
+Check replication metrics in the AWS console under **S3 → Management → Replication metrics**.
+
+## Module Inputs
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `source_bucket_arn` | ARN of the primary Velero bucket | — |
+| `source_bucket_id` | ID of the primary Velero bucket | — |
+| `destination_bucket_name` | Name for the DR replica bucket | — |
+| `destination_region` | DR AWS region | `us-west-2` |
+| `source_region` | Primary AWS region | `us-east-1` |
+| `backup_retention_days` | Lifecycle expiry on replica bucket | `30` |
+
+## Module Outputs
+
+| Output | Description |
+|--------|-------------|
+| `replica_bucket_arn` | DR replica bucket ARN |
+| `replica_bucket_id` | DR replica bucket name |
+| `replication_role_arn` | IAM role ARN used by S3 CRR |
