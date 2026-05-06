@@ -1,8 +1,6 @@
-# Feature: Automated DR Drill — GitHub Actions
+# Feature: RTO/RPO Monitoring Dashboard
 
-A GitHub Actions workflow that runs a full DR drill every Sunday at 03:00 UTC (and on demand). It finds the latest Velero backup, asserts it meets the RPO target, performs a namespace restore in the DR cluster, validates it, cleans up, and generates a drill report posted to Slack.
-
-## Workflow Overview
+Prometheus alerting rules and a Grafana dashboard that give real-time visibility into backup health, RPO exposure, and storage availability. Alerts fire before an RPO breach becomes a real incident.
 
 ## Components
 
@@ -10,81 +8,76 @@ runbooks/
 ├── full-cluster-restore.md   # 6-step DR procedure with RTO targets
 └── rds-restore.md            # RDS snapshot restore + secret update
 ```
-.github/workflows/dr-drill.yml
+kubernetes/monitoring/
+├── velero-servicemonitor.yaml   # Scrapes Velero /metrics every 30s
+└── backup-alerts.yaml           # 6 PrometheusRules for DR health
 
-identify-backup ──► restore-drill ──► measure-rto
-     │                   │                │
-  Find latest        Restore app     Generate report
-  backup + assert    namespace in    + upload artifact
-  backup age < 25h   DR cluster      + post to Slack
-                     Validate
-                     Cleanup
+monitoring/grafana/
+└── dr-dashboard.json            # Grafana dashboard — 7 panels
 ```
 
-## Triggers
+## Alerts
 
-| Trigger | Schedule / Condition |
-|---------|----------------------|
-| Scheduled | Every Sunday 03:00 UTC |
-| Manual dispatch | Any time via GitHub Actions UI |
+| Alert | Severity | Condition | Action |
+|-------|----------|-----------|--------|
+| `VeleroBackupRPOBreach` | critical | Hourly backup not completed in >2h | Check Velero logs, trigger manual backup |
+| `VeleroDailyBackupMissing` | warning | Daily full backup not completed in >25h | Inspect schedule, check S3 connectivity |
+| `VeleroBackupFailed` | critical | Any backup failure counter > 0 | `kubectl -n velero get backups` |
+| `VeleroBackupPartialFailure` | warning | Partial failure counter > 0 | Check which resources failed to backup |
+| `VeleroBackupStorageUnavailable` | critical | S3 storage location unreachable | Check S3 bucket policy and network connectivity |
+| `VeleroControllerDown` | critical | Velero pod not running | Check pod status in `velero` namespace |
 
-### Manual Dispatch Inputs
+All critical alerts link to the restore runbook in their annotations.
 
-| Input | Options | Default |
-|-------|---------|---------|
-| `environment` | `staging`, `prod` | `staging` |
-| `dry_run` | `true`, `false` | `true` |
+## Grafana Dashboard Panels
 
-A dry run validates all steps (backup found, age within RPO) without performing an actual restore — safe to run at any time.
+| Panel | Type | What it shows |
+|-------|------|---------------|
+| Time Since Last Successful Backup | Stat (red >2h) | RPO exposure per schedule |
+| Backup Success Rate (24h) | Stat (red <99%) | Overall backup reliability |
+| Storage Location Status | Stat | S3 available / unavailable |
+| Backup Duration by Schedule | Timeseries | How long each backup takes |
+| Backup Size by Schedule | Timeseries | Storage growth trend |
+| Backup Failures (24h) | Timeseries | Failure spikes |
+| Total Backups in Storage | Timeseries | Retention window health |
 
-## Jobs
+## Prerequisites
 
-### `identify-backup`
-- Connects to the primary EKS cluster
-- Lists all Velero backups and finds the most recent `Completed` one
-- Calculates backup age in hours
-- Fails the workflow if the backup is older than 25 hours (RPO breach)
+- `kube-prometheus-stack` Helm release installed with label `release: kube-prometheus-stack`
+- Velero installed with `metrics.enabled: true` and `metrics.serviceMonitor.enabled: true`
+- Grafana accessible (via port-forward or ingress)
 
-### `restore-drill`
-- Connects to the DR EKS cluster
-- Runs `scripts/restore/restore-namespace.sh` for the `app` namespace
-- Runs `scripts/restore/validate-restore.sh` (skipped in dry-run mode)
-- Cleans up the test restore after validation
+## Deploy
 
-### `measure-rto`
-- Runs `scripts/dr-drill/generate-report.sh` to produce a markdown report
-- Uploads the report as a GitHub Actions artifact (retained 90 days)
-- Posts pass/fail summary to Slack (if `SLACK_WEBHOOK_URL` secret is set)
+```bash
+# Apply ServiceMonitor and alert rules
+kubectl apply -f kubernetes/monitoring/velero-servicemonitor.yaml
+kubectl apply -f kubernetes/monitoring/backup-alerts.yaml
 
-## Required GitHub Secrets
+# Import Grafana dashboard
+# In Grafana UI: Dashboards → Import → Upload dr-dashboard.json
+```
 
-| Secret | Description |
-|--------|-------------|
-| `AWS_ACCESS_KEY_ID` | AWS access key |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret key |
-| `PRIMARY_CLUSTER_NAME` | EKS cluster name in `us-east-1` |
-| `DR_CLUSTER_NAME` | EKS cluster name in `us-west-2` |
-| `DR_APP_ENDPOINT` | ALB DNS for the DR cluster app (health check) |
-| `SLACK_WEBHOOK_URL` | Slack incoming webhook URL (optional) |
+Or if using the `kube-prometheus-stack` Helm release, add the dashboard via `grafana.dashboards`:
 
-## GitHub Environments
+```yaml
+grafana:
+  dashboards:
+    default:
+      dr-dashboard:
+        url: https://raw.githubusercontent.com/Govind-Kandale-1/k8s-disaster-recovery/feature/rto-rpo-monitoring-dashboard/monitoring/grafana/dr-dashboard.json
+```
 
-The `restore-drill` job runs in the `dr-drill-staging` or `dr-drill-prod` environment. Configure protection rules in **GitHub → Settings → Environments** to require approval before a live drill runs against production.
+## Verify Alerts Are Loaded
 
-## Drill Report
+```bash
+kubectl -n monitoring get prometheusrule dr-backup-alerts
+kubectl -n monitoring get servicemonitor velero
+```
 
-Each run produces `dr-drill-report.md` with:
-- RTO achieved (workflow duration in minutes)
-- RPO exposure (backup age at drill time)
-- Per-check pass/fail table
-- Link to the GitHub Actions run
+Check Prometheus has picked up the rules:
 
-Reports are stored as workflow artifacts for 90 days for audit and trend tracking.
-
-## Running a Manual Dry Run
-
-1. Go to **Actions → DR Drill → Run workflow**
-2. Select `environment: staging`, `dry_run: true`
-3. Click **Run workflow**
-
-No resources will be created or modified in the DR cluster.
+```bash
+kubectl -n monitoring port-forward svc/kube-prometheus-stack-prometheus 9090
+# Open http://localhost:9090/rules and search for "velero"
+```
