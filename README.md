@@ -1,73 +1,71 @@
-# Feature: Velero Backup Setup
+# Feature: RDS Snapshot Automation
 
-Installs Velero into EKS with an AWS S3 backend, IRSA-based authentication, and three pre-configured backup schedules covering hourly, daily, and pre-deployment use cases.
+Automatically copies RDS automated snapshots to the DR region via a Lambda function triggered by EventBridge. Old DR copies are pruned on a rolling retention window, keeping storage costs under control.
+
+## How It Works
+
+```
+RDS automated snapshot completes (us-east-1)
+        │
+        ▼
+EventBridge rule (RDS-EVENT-0002)
+        │
+        ▼
+Lambda: rds-snapshot-copy
+  ├── Copies snapshot to us-west-2 with KMS encryption
+  ├── Tags copy with CopiedFrom, CopiedAt, ManagedBy
+  └── Deletes DR copies older than RETENTION_DAYS
+```
 
 ## Components
 
 ```
-terraform/modules/velero/
-├── main.tf        # S3 bucket, IRSA role, Velero Helm release
+lambda/rds-snapshot-copy/
+└── handler.py          # Python 3.12 Lambda — copy + cleanup logic
+
+terraform/modules/rds-backup/
+├── main.tf             # Lambda, CloudWatch log group, EventBridge rule + target,
+│                       # Lambda permission, RDS backup window config
 ├── variables.tf
 └── outputs.tf
-
-terraform/environments/primary/
-└── main.tf        # Wires the module to an existing EKS cluster
-
-kubernetes/velero/schedules/
-├── hourly-namespace-backup.yaml   # app + monitoring, 7-day TTL
-├── daily-full-backup.yaml         # full cluster, 30-day TTL
-└── pre-deploy-backup.yaml         # paused template, triggered manually before prod deploys
 ```
 
 ## Prerequisites
 
-- EKS cluster running in `us-east-1`
-- Terraform >= 1.5.0
-- Helm 3
-- `kubectl` and `velero` CLI installed
-- S3 remote state backend bootstrapped
+- RDS instances with automated backups enabled
+- Terraform >= 1.5.0, Python 3.12 available for packaging
+- AWS credentials with `rds:*`, `lambda:*`, and `events:*` permissions
 
 ## Deploy
 
 ```bash
 cd terraform/environments/primary
-terraform init
 terraform apply \
-  -var="cluster_name=devops-prod" \
-  -var="eks_oidc_provider=oidc.eks.us-east-1.amazonaws.com/id/XXXXXXXX"
+  -var="db_instance_ids=[\"devops-dev-db\",\"devops-prod-db\"]"
 ```
 
 Terraform will:
-1. Create an encrypted, versioned S3 bucket with a 30-day lifecycle rule
-2. Create an IAM role (IRSA) with `s3:*` and EC2 snapshot permissions, trusted by the Velero service account
-3. Install Velero via Helm with the AWS plugin and metrics enabled
+1. Package `lambda/rds-snapshot-copy/handler.py` into a ZIP
+2. Create the Lambda with `SOURCE_REGION`, `DR_REGION`, `RETENTION_DAYS` env vars
+3. Create a CloudWatch EventBridge rule filtering on `RDS-EVENT-0002` for the specified instance IDs
+4. Grant EventBridge permission to invoke the Lambda
+5. Set `backup_window` and `backup_retention_period` on each RDS instance
 
-## Apply Backup Schedules
+## Verify
+
+After a snapshot completes, check Lambda logs:
 
 ```bash
-kubectl apply -f kubernetes/velero/schedules/
+aws logs tail /aws/lambda/rds-snapshot-copy-<env> --follow
 ```
 
-Verify schedules are registered:
+List DR copies:
 
 ```bash
-velero schedule get
-```
-
-## Trigger a Manual Pre-Deploy Backup
-
-Before any production deployment, create a snapshot from the paused template:
-
-```bash
-velero backup create "pre-deploy-$(date +%Y%m%d%H%M)" \
-  --from-schedule pre-deploy-hook
-```
-
-## Verify a Backup
-
-```bash
-velero backup get
-velero backup describe <backup-name> --details
+aws rds describe-db-snapshots \
+  --region us-west-2 \
+  --query "DBSnapshots[?TagList[?Key=='ManagedBy'&&Value=='dr-automation']].[DBSnapshotIdentifier,SnapshotCreateTime,Status]" \
+  --output table
 ```
 
 ## Module Inputs
@@ -75,16 +73,18 @@ velero backup describe <backup-name> --details
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `environment` | Deployment environment | — |
-| `aws_region` | AWS region | — |
-| `cluster_name` | EKS cluster name | — |
-| `eks_oidc_provider` | OIDC provider URL (no `https://`) | — |
-| `velero_version` | Helm chart version | `6.0.0` |
-| `backup_retention_days` | S3 lifecycle expiry in days | `30` |
+| `aws_region` | Source (primary) AWS region | — |
+| `dr_region` | DR AWS region | `us-west-2` |
+| `db_instance_ids` | List of RDS instance IDs to watch | — |
+| `retention_days` | Days to keep DR snapshot copies | `30` |
+| `dr_kms_key_id` | KMS key for DR snapshot encryption | `alias/aws/rds` |
+| `backup_window` | RDS preferred backup window (UTC) | `02:00-03:00` |
+| `backup_retention` | RDS automated backup retention days | `7` |
 
 ## Module Outputs
 
 | Output | Description |
 |--------|-------------|
-| `bucket_name` | Velero S3 bucket name |
-| `bucket_arn` | Velero S3 bucket ARN |
-| `irsa_role_arn` | IAM role ARN attached to the Velero service account |
+| `lambda_function_arn` | Lambda function ARN |
+| `lambda_function_name` | Lambda function name |
+| `eventbridge_rule_arn` | EventBridge rule ARN |
