@@ -1,0 +1,20 @@
+# Triggered manually before every production deployment via CI:
+#   velero backup create pre-deploy-$(date +%Y%m%d%H%M) --from-schedule pre-deploy-hook
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: pre-deploy-hook
+  namespace: velero
+  labels:
+    tier: pre-deploy
+spec:
+  schedule: "0 0 31 2 *"   # Never fires automatically — used as a template only
+  paused: true
+  template:
+    includedNamespaces:
+      - app
+    storageLocation: default
+    volumeSnapshotLocations:
+      - default
+    ttl: 48h0m0s
+    snapshotVolumes: true

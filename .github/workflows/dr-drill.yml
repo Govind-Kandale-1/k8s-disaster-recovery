@@ -1,0 +1,161 @@
+name: DR Drill
+
+on:
+  schedule:
+    - cron: "0 3 * * 0"   # Every Sunday 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to drill (staging or prod)"
+        required: true
+        default: staging
+        type: choice
+        options: [staging, prod]
+      dry_run:
+        description: "Dry run — validate steps without restoring"
+        required: false
+        default: "true"
+        type: boolean
+
+env:
+  DR_REGION: us-west-2
+  PRIMARY_REGION: us-east-1
+  DRILL_ENV: ${{ github.event.inputs.environment || 'staging' }}
+  DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+
+jobs:
+
+  identify-backup:
+    name: Identify Latest Backup
+    runs-on: ubuntu-latest
+    outputs:
+      backup_name: ${{ steps.find.outputs.backup_name }}
+      backup_age_hours: ${{ steps.find.outputs.backup_age_hours }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (primary)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.PRIMARY_REGION }}
+
+      - name: Connect to primary EKS
+        run: aws eks update-kubeconfig --name ${{ secrets.PRIMARY_CLUSTER_NAME }} --region ${{ env.PRIMARY_REGION }}
+
+      - name: Install Velero CLI
+        run: |
+          curl -fsSL https://github.com/vmware-tanzu/velero/releases/download/v1.13.0/velero-v1.13.0-linux-amd64.tar.gz | tar -xz
+          sudo mv velero-v1.13.0-linux-amd64/velero /usr/local/bin/
+
+      - name: Find latest completed backup
+        id: find
+        run: |
+          BACKUP=$(velero backup get -o json \
+            | jq -r '[.items[] | select(.status.phase=="Completed")] | sort_by(.status.completionTimestamp) | last | .metadata.name')
+
+          if [[ -z "$BACKUP" || "$BACKUP" == "null" ]]; then
+            echo "ERROR: No completed Velero backup found"
+            exit 1
+          fi
+
+          COMPLETED=$(velero backup describe "$BACKUP" | grep "Completed:" | awk '{print $2, $3}')
+          HOURS=$(( ($(date -u +%s) - $(date -d "$COMPLETED" +%s)) / 3600 ))
+
+          echo "backup_name=$BACKUP"         >> "$GITHUB_OUTPUT"
+          echo "backup_age_hours=$HOURS"     >> "$GITHUB_OUTPUT"
+          echo "Found backup: $BACKUP ($HOURS hours old)"
+
+      - name: Assert backup freshness
+        run: |
+          MAX_AGE=25  # fail drill if latest backup is older than 25h
+          if [[ "${{ steps.find.outputs.backup_age_hours }}" -gt "$MAX_AGE" ]]; then
+            echo "FAIL: Latest backup is ${{ steps.find.outputs.backup_age_hours }}h old (max $MAX_AGE h)"
+            exit 1
+          fi
+
+  restore-drill:
+    name: Namespace Restore Drill
+    needs: identify-backup
+    runs-on: ubuntu-latest
+    environment: dr-drill-${{ github.event.inputs.environment || 'staging' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (DR)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.DR_REGION }}
+
+      - name: Connect to DR EKS
+        run: aws eks update-kubeconfig --name ${{ secrets.DR_CLUSTER_NAME }} --region ${{ env.DR_REGION }}
+
+      - name: Install Velero CLI
+        run: |
+          curl -fsSL https://github.com/vmware-tanzu/velero/releases/download/v1.13.0/velero-v1.13.0-linux-amd64.tar.gz | tar -xz
+          sudo mv velero-v1.13.0-linux-amd64/velero /usr/local/bin/
+
+      - name: Run namespace restore drill
+        run: |
+          DRY_FLAG=""
+          [[ "${{ env.DRY_RUN }}" == "true" ]] && DRY_FLAG="--dry-run"
+
+          bash scripts/restore/restore-namespace.sh \
+            --backup "${{ needs.identify-backup.outputs.backup_name }}" \
+            --namespace app \
+            $DRY_FLAG
+
+      - name: Validate restore
+        if: env.DRY_RUN == 'false'
+        env:
+          VALIDATE_NAMESPACES: app
+          HEALTH_ENDPOINTS: "http://${{ secrets.DR_APP_ENDPOINT }}/api/health"
+        run: bash scripts/restore/validate-restore.sh
+
+      - name: Cleanup drill restore
+        if: env.DRY_RUN == 'false' && always()
+        run: |
+          # Remove drill restore so DR cluster stays clean
+          RESTORE=$(velero restore get | grep "ns-restore-app" | awk '{print $1}' | tail -1)
+          [[ -n "$RESTORE" ]] && velero restore delete "$RESTORE" --confirm
+
+  measure-rto:
+    name: Measure & Report RTO
+    needs: [identify-backup, restore-drill]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate drill report
+        run: |
+          bash scripts/dr-drill/generate-report.sh \
+            --backup    "${{ needs.identify-backup.outputs.backup_name }}" \
+            --backup-age "${{ needs.identify-backup.outputs.backup_age_hours }}" \
+            --restore-status "${{ needs.restore-drill.result }}" \
+            --dry-run   "${{ env.DRY_RUN }}" \
+            --env       "${{ env.DRILL_ENV }}"
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dr-drill-report-${{ github.run_number }}
+          path: dr-drill-report.md
+          retention-days: 90
+
+      - name: Post summary to Slack
+        if: secrets.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          STATUS="${{ needs.restore-drill.result }}"
+          EMOJI=$([[ "$STATUS" == "success" ]] && echo ":white_check_mark:" || echo ":red_circle:")
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\": \"$EMOJI DR Drill [${{ env.DRILL_ENV }}] — Restore: $STATUS | Backup age: ${{ needs.identify-backup.outputs.backup_age_hours }}h | Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}"

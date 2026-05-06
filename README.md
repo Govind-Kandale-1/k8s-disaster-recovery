@@ -4,6 +4,9 @@ Prometheus alerting rules and a Grafana dashboard that give real-time visibility
 
 ## Components
 
+runbooks/
+├── full-cluster-restore.md   # 6-step DR procedure with RTO targets
+└── rds-restore.md            # RDS snapshot restore + secret update
 ```
 kubernetes/monitoring/
 ├── velero-servicemonitor.yaml   # Scrapes Velero /metrics every 30s
