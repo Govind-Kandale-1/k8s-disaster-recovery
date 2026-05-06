@@ -1,0 +1,134 @@
+{
+  "title": "Disaster Recovery — RTO/RPO Overview",
+  "uid": "dr-rto-rpo",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "tags": ["dr", "velero", "rpo", "rto"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Time Since Last Successful Backup (RPO exposure)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "(time() - max by (schedule) (velero_backup_last_successful_timestamp)) / 3600",
+          "legendFormat": "{{ schedule }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h",
+          "thresholds": {
+            "steps": [
+              { "color": "green",  "value": 0 },
+              { "color": "yellow", "value": 1 },
+              { "color": "red",    "value": 2 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Backup Success Rate (24h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(increase(velero_backup_success_total[24h])) / (sum(increase(velero_backup_success_total[24h])) + sum(increase(velero_backup_failure_total[24h]))) * 100",
+          "legendFormat": "Success %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              { "color": "red",    "value": 0 },
+              { "color": "yellow", "value": 90 },
+              { "color": "green",  "value": 99 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Storage Location Status",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "targets": [
+        {
+          "expr": "velero_backup_storage_location_phase",
+          "legendFormat": "{{ backup_storage_location }} — {{ phase }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "text": "Unavailable", "color": "red" }, "1": { "text": "Available", "color": "green" } }, "type": "value" }
+          ]
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Backup Duration by Schedule",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "expr": "velero_backup_duration_seconds",
+          "legendFormat": "{{ schedule }}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 5,
+      "title": "Backup Size by Schedule",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "expr": "velero_backup_tarball_size_bytes",
+          "legendFormat": "{{ schedule }}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes" } }
+    },
+    {
+      "id": 6,
+      "title": "Backup Failures (24h)",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "increase(velero_backup_failure_total[1h])",
+          "legendFormat": "Failures per hour"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 1 } ] },
+          "custom": { "fillOpacity": 20 }
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Total Backups in Storage",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "expr": "velero_backup_total",
+          "legendFormat": "Total backups"
+        }
+      ]
+    }
+  ]
+}

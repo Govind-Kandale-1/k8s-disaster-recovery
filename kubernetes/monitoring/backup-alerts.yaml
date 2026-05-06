@@ -1,0 +1,81 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: dr-backup-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: velero.backup
+      interval: 60s
+      rules:
+
+        # ── RPO breach: no successful backup in the last 2 hours ──────────────
+        - alert: VeleroBackupRPOBreach
+          expr: |
+            (time() - max by (schedule) (velero_backup_last_successful_timestamp{schedule=~"hourly.*"})) > 7200
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Velero backup RPO breached for schedule {{ $labels.schedule }}"
+            description: "Last successful backup for {{ $labels.schedule }} was {{ humanizeDuration $value }} ago. RPO target is 1h."
+            runbook: "https://github.com/Govind-Kandale-1/k8s-disaster-recovery/blob/main/runbooks/full-cluster-restore.md"
+
+        # ── Daily full backup missing ─────────────────────────────────────────
+        - alert: VeleroDailyBackupMissing
+          expr: |
+            (time() - max(velero_backup_last_successful_timestamp{schedule="daily-full-backup"})) > 90000
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Daily full Velero backup not completed in 25 hours"
+            description: "Last successful daily backup was {{ humanizeDuration $value }} ago."
+
+        # ── Backup failure ────────────────────────────────────────────────────
+        - alert: VeleroBackupFailed
+          expr: velero_backup_failure_total > 0
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Velero backup failure detected"
+            description: "{{ $value }} backup(s) have failed. Check: kubectl -n velero get backups"
+
+        # ── Partial backup ────────────────────────────────────────────────────
+        - alert: VeleroBackupPartialFailure
+          expr: velero_backup_partial_failure_total > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Velero backup partially failed"
+            description: "{{ $value }} backup(s) partially failed — some resources may not be recoverable."
+
+        # ── Storage location unavailable ──────────────────────────────────────
+        - alert: VeleroBackupStorageUnavailable
+          expr: velero_backup_storage_location_phase{phase="Unavailable"} == 1
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Velero backup storage location {{ $labels.backup_storage_location }} is unavailable"
+            description: "Cannot reach S3 backup storage. New backups will fail."
+
+        # ── Velero controller down ────────────────────────────────────────────
+        - alert: VeleroControllerDown
+          expr: up{job="velero"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Velero controller is down"
+            description: "Velero is not running. No backups will be taken until it is restored."
