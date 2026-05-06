@@ -1,23 +1,8 @@
-# Feature: S3 Cross-Region Replication
+# Feature: Automated DR Drill — GitHub Actions
 
-Automatically replicates every Velero backup object from the primary S3 bucket (`us-east-1`) to a DR replica bucket (`us-west-2`) using S3 Cross-Region Replication (CRR). Backups are available in the DR region within seconds of being written.
+A GitHub Actions workflow that runs a full DR drill every Sunday at 03:00 UTC (and on demand). It finds the latest Velero backup, asserts it meets the RPO target, performs a namespace restore in the DR cluster, validates it, cleans up, and generates a drill report posted to Slack.
 
-## Architecture
-
-```
-us-east-1 (primary)                    us-west-2 (DR)
-┌────────────────────────┐              ┌────────────────────────┐
-│ velero-backups-primary │ ──── CRR ──► │ velero-backups-dr      │
-│ (STANDARD)             │              │ (STANDARD_IA)          │
-│ Versioning: enabled    │              │ Versioning: enabled    │
-│ SSE: AES256            │              │ SSE: AES256            │
-└────────────────────────┘              └────────────────────────┘
-         ▲
-   IAM replication role
-   (assumed by S3 service)
-```
-
-`STANDARD_IA` is used in the DR bucket to reduce storage costs — DR backups are accessed rarely (only during actual recovery).
+## Workflow Overview
 
 ## Components
 
@@ -25,57 +10,81 @@ runbooks/
 ├── full-cluster-restore.md   # 6-step DR procedure with RTO targets
 └── rds-restore.md            # RDS snapshot restore + secret update
 ```
-terraform/modules/s3-replication/
-├── main.tf        # Replica bucket, IAM role, replication config on source bucket
-├── variables.tf
-└── outputs.tf
+.github/workflows/dr-drill.yml
 
-terraform/environments/dr/
-└── main.tf        # DR environment — reads primary state via remote_state
+identify-backup ──► restore-drill ──► measure-rto
+     │                   │                │
+  Find latest        Restore app     Generate report
+  backup + assert    namespace in    + upload artifact
+  backup age < 25h   DR cluster      + post to Slack
+                     Validate
+                     Cleanup
 ```
 
-## Prerequisites
+## Triggers
 
-- `feature/velero-backup-setup` applied first (provides source bucket ARN/ID)
-- Terraform remote state for `dr/primary` accessible
-- AWS credentials with permissions in both `us-east-1` and `us-west-2`
+| Trigger | Schedule / Condition |
+|---------|----------------------|
+| Scheduled | Every Sunday 03:00 UTC |
+| Manual dispatch | Any time via GitHub Actions UI |
 
-## Deploy
+### Manual Dispatch Inputs
 
-```bash
-cd terraform/environments/dr
-terraform init
-terraform apply
-```
+| Input | Options | Default |
+|-------|---------|---------|
+| `environment` | `staging`, `prod` | `staging` |
+| `dry_run` | `true`, `false` | `true` |
 
-Terraform reads the primary environment's remote state to obtain the source bucket ARN and ID automatically — no manual wiring needed.
+A dry run validates all steps (backup found, age within RPO) without performing an actual restore — safe to run at any time.
 
-## Verify Replication
+## Jobs
 
-After applying, upload a test object to the primary bucket and confirm it appears in the replica within ~60 seconds:
+### `identify-backup`
+- Connects to the primary EKS cluster
+- Lists all Velero backups and finds the most recent `Completed` one
+- Calculates backup age in hours
+- Fails the workflow if the backup is older than 25 hours (RPO breach)
 
-```bash
-echo "test" | aws s3 cp - s3://<primary-bucket>/replication-test.txt
-aws s3 ls s3://<dr-bucket>/ --region us-west-2 | grep replication-test
-```
+### `restore-drill`
+- Connects to the DR EKS cluster
+- Runs `scripts/restore/restore-namespace.sh` for the `app` namespace
+- Runs `scripts/restore/validate-restore.sh` (skipped in dry-run mode)
+- Cleans up the test restore after validation
 
-Check replication metrics in the AWS console under **S3 → Management → Replication metrics**.
+### `measure-rto`
+- Runs `scripts/dr-drill/generate-report.sh` to produce a markdown report
+- Uploads the report as a GitHub Actions artifact (retained 90 days)
+- Posts pass/fail summary to Slack (if `SLACK_WEBHOOK_URL` secret is set)
 
-## Module Inputs
+## Required GitHub Secrets
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `source_bucket_arn` | ARN of the primary Velero bucket | — |
-| `source_bucket_id` | ID of the primary Velero bucket | — |
-| `destination_bucket_name` | Name for the DR replica bucket | — |
-| `destination_region` | DR AWS region | `us-west-2` |
-| `source_region` | Primary AWS region | `us-east-1` |
-| `backup_retention_days` | Lifecycle expiry on replica bucket | `30` |
-
-## Module Outputs
-
-| Output | Description |
+| Secret | Description |
 |--------|-------------|
-| `replica_bucket_arn` | DR replica bucket ARN |
-| `replica_bucket_id` | DR replica bucket name |
-| `replication_role_arn` | IAM role ARN used by S3 CRR |
+| `AWS_ACCESS_KEY_ID` | AWS access key |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret key |
+| `PRIMARY_CLUSTER_NAME` | EKS cluster name in `us-east-1` |
+| `DR_CLUSTER_NAME` | EKS cluster name in `us-west-2` |
+| `DR_APP_ENDPOINT` | ALB DNS for the DR cluster app (health check) |
+| `SLACK_WEBHOOK_URL` | Slack incoming webhook URL (optional) |
+
+## GitHub Environments
+
+The `restore-drill` job runs in the `dr-drill-staging` or `dr-drill-prod` environment. Configure protection rules in **GitHub → Settings → Environments** to require approval before a live drill runs against production.
+
+## Drill Report
+
+Each run produces `dr-drill-report.md` with:
+- RTO achieved (workflow duration in minutes)
+- RPO exposure (backup age at drill time)
+- Per-check pass/fail table
+- Link to the GitHub Actions run
+
+Reports are stored as workflow artifacts for 90 days for audit and trend tracking.
+
+## Running a Manual Dry Run
+
+1. Go to **Actions → DR Drill → Run workflow**
+2. Select `environment: staging`, `dry_run: true`
+3. Click **Run workflow**
+
+No resources will be created or modified in the DR cluster.
