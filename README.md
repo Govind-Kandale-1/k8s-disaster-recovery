@@ -1,101 +1,93 @@
-# Feature: Restore Runbook Automation
+# Feature: RDS Snapshot Automation
 
-Bash scripts and operational runbooks for restoring Kubernetes workloads and RDS databases from Velero backups. Covers full cluster restore, single namespace restore, post-restore validation, and step-by-step operator runbooks.
+Automatically copies RDS automated snapshots to the DR region via a Lambda function triggered by EventBridge. Old DR copies are pruned on a rolling retention window, keeping storage costs under control.
 
-## Scripts
+## How It Works
 
 ```
-scripts/restore/
-├── restore-cluster.sh     # Full cluster restore with validation
-├── restore-namespace.sh   # Single namespace targeted restore
-└── validate-restore.sh    # Post-restore health checks
+RDS automated snapshot completes (us-east-1)
+        │
+        ▼
+EventBridge rule (RDS-EVENT-0002)
+        │
+        ▼
+Lambda: rds-snapshot-copy
+  ├── Copies snapshot to us-west-2 with KMS encryption
+  ├── Tags copy with CopiedFrom, CopiedAt, ManagedBy
+  └── Deletes DR copies older than RETENTION_DAYS
+```
+
+## Components
 
 runbooks/
 ├── full-cluster-restore.md   # 6-step DR procedure with RTO targets
 └── rds-restore.md            # RDS snapshot restore + secret update
 ```
+lambda/rds-snapshot-copy/
+└── handler.py          # Python 3.12 Lambda — copy + cleanup logic
 
-## restore-cluster.sh
-
-Full cluster restore from any completed Velero backup.
-
-```bash
-# Dry run first — validates backup exists without restoring
-./scripts/restore/restore-cluster.sh \
-  --backup daily-full-backup-20240601020000 \
-  --cluster devops-dr \
-  --region us-west-2 \
-  --dry-run
-
-# Live restore
-./scripts/restore/restore-cluster.sh \
-  --backup daily-full-backup-20240601020000 \
-  --cluster devops-dr \
-  --region us-west-2
+terraform/modules/rds-backup/
+├── main.tf             # Lambda, CloudWatch log group, EventBridge rule + target,
+│                       # Lambda permission, RDS backup window config
+├── variables.tf
+└── outputs.tf
 ```
-
-The script:
-1. Switches `kubectl` context to the DR cluster
-2. Verifies Velero is running and the backup is `Completed`
-3. Creates a Velero restore and polls until done
-4. Automatically runs `validate-restore.sh`
-
-## restore-namespace.sh
-
-Restore a single namespace without touching the rest of the cluster — useful for recovering from accidental deletion or corruption of one team's namespace.
-
-```bash
-./scripts/restore/restore-namespace.sh \
-  --backup hourly-namespace-backup-20240601110000 \
-  --namespace app
-
-# Dry run
-./scripts/restore/restore-namespace.sh \
-  --backup hourly-namespace-backup-20240601110000 \
-  --namespace app \
-  --dry-run
-```
-
-## validate-restore.sh
-
-Runs automatically after a restore. Can also be run standalone at any time.
-
-```bash
-# Validate specific namespaces and health endpoints
-VALIDATE_NAMESPACES="app monitoring" \
-HEALTH_ENDPOINTS="http://<alb-dns>/api/health" \
-./scripts/restore/validate-restore.sh
-```
-
-Checks performed:
-- All Deployments have the expected number of ready replicas
-- All PVCs are in `Bound` state
-- HTTP health endpoints return `200`
-- No failed/partially-failed Velero restores in the cluster
-
-Exit code `0` = all checks passed. Exit code `1` = one or more checks failed.
-
-## Runbooks
-
-### Full Cluster Restore (`runbooks/full-cluster-restore.md`)
-
-Step-by-step operator guide for a full region failover:
-1. Declare incident and assign roles
-2. Identify latest good backup
-3. Run `restore-cluster.sh`
-4. Restore RDS from DR snapshot (parallel)
-5. Run validation
-6. Update DNS to point to DR ALB
-
-**RTO target:** 30 minutes (prod critical)
-
-### RDS Restore (`runbooks/rds-restore.md`)
-
-Commands to list DR snapshots, restore to a new RDS instance, and update the Kubernetes secret with the new endpoint.
 
 ## Prerequisites
 
-- `velero` CLI installed and configured against target cluster
-- `kubectl` with access to the DR cluster
-- `aws` CLI configured for both primary and DR regions
-- Velero installed in DR cluster pointing to DR S3 bucket
+- RDS instances with automated backups enabled
+- Terraform >= 1.5.0, Python 3.12 available for packaging
+- AWS credentials with `rds:*`, `lambda:*`, and `events:*` permissions
+
+## Deploy
+
+```bash
+cd terraform/environments/primary
+terraform apply \
+  -var="db_instance_ids=[\"devops-dev-db\",\"devops-prod-db\"]"
+```
+
+Terraform will:
+1. Package `lambda/rds-snapshot-copy/handler.py` into a ZIP
+2. Create the Lambda with `SOURCE_REGION`, `DR_REGION`, `RETENTION_DAYS` env vars
+3. Create a CloudWatch EventBridge rule filtering on `RDS-EVENT-0002` for the specified instance IDs
+4. Grant EventBridge permission to invoke the Lambda
+5. Set `backup_window` and `backup_retention_period` on each RDS instance
+
+## Verify
+
+After a snapshot completes, check Lambda logs:
+
+```bash
+aws logs tail /aws/lambda/rds-snapshot-copy-<env> --follow
+```
+
+List DR copies:
+
+```bash
+aws rds describe-db-snapshots \
+  --region us-west-2 \
+  --query "DBSnapshots[?TagList[?Key=='ManagedBy'&&Value=='dr-automation']].[DBSnapshotIdentifier,SnapshotCreateTime,Status]" \
+  --output table
+```
+
+## Module Inputs
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `environment` | Deployment environment | — |
+| `aws_region` | Source (primary) AWS region | — |
+| `dr_region` | DR AWS region | `us-west-2` |
+| `db_instance_ids` | List of RDS instance IDs to watch | — |
+| `retention_days` | Days to keep DR snapshot copies | `30` |
+| `dr_kms_key_id` | KMS key for DR snapshot encryption | `alias/aws/rds` |
+| `backup_window` | RDS preferred backup window (UTC) | `02:00-03:00` |
+| `backup_retention` | RDS automated backup retention days | `7` |
+
+## Module Outputs
+
+| Output | Description |
+|--------|-------------|
+| `lambda_function_arn` | Lambda function ARN |
+| `lambda_function_name` | Lambda function name |
+| `eventbridge_rule_arn` | EventBridge rule ARN |
