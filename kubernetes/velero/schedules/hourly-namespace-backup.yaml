@@ -1,0 +1,25 @@
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: hourly-namespace-backup
+  namespace: velero
+  labels:
+    tier: critical
+    rpo: 1h
+spec:
+  schedule: "0 * * * *"   # every hour
+  template:
+    includedNamespaces:
+      - app
+      - monitoring
+    excludedResources:
+      - events
+      - events.events.k8s.io
+    storageLocation: default
+    volumeSnapshotLocations:
+      - default
+    ttl: 168h0m0s   # 7 days
+    snapshotVolumes: true
+    labelSelector:
+      matchLabels:
+        backup: "true"

@@ -4,6 +4,11 @@ A GitHub Actions workflow that runs a full DR drill every Sunday at 03:00 UTC (a
 
 ## Workflow Overview
 
+## Components
+
+runbooks/
+├── full-cluster-restore.md   # 6-step DR procedure with RTO targets
+└── rds-restore.md            # RDS snapshot restore + secret update
 ```
 .github/workflows/dr-drill.yml
 
