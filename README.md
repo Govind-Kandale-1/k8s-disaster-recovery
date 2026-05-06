@@ -1,57 +1,85 @@
-# k8s-disaster-recovery
+# Feature: Automated DR Drill — GitHub Actions
 
-Production-grade Disaster Recovery platform for Kubernetes on AWS.
+A GitHub Actions workflow that runs a full DR drill every Sunday at 03:00 UTC (and on demand). It finds the latest Velero backup, asserts it meets the RPO target, performs a namespace restore in the DR cluster, validates it, cleans up, and generates a drill report posted to Slack.
 
-## What this project covers
-
-| Feature | Branch | Tools |
-|---------|--------|-------|
-| Velero backup + S3 backend | `feature/velero-backup-setup` | Velero, Helm, Terraform, IRSA |
-| Cross-region S3 replication | `feature/s3-cross-region-replication` | S3 CRR, IAM, Terraform |
-| RDS snapshot automation | `feature/rds-snapshot-automation` | Lambda, CloudWatch Events, Terraform |
-| Restore runbook automation | `feature/restore-runbook-automation` | Bash, Velero CLI, kubectl |
-| Automated DR drills | `feature/dr-drill-github-action` | GitHub Actions, k6, Bash |
-| RTO/RPO monitoring dashboard | `feature/rto-rpo-monitoring-dashboard` | Prometheus, Grafana, Alertmanager |
-
-## Architecture
+## Workflow Overview
 
 ```
-Primary Region (us-east-1)                DR Region (us-west-2)
-┌──────────────────────────┐              ┌──────────────────────────┐
-│  EKS Cluster             │              │  EKS Cluster (standby)   │
-│  ├── Velero              │──backups──►  │  ├── Velero              │
-│  │   ├── Hourly NS backup│              │  │   └── Restore target   │
-│  │   └── Daily full      │              │  └── Apps (restored)     │
-│  └── Apps                │              │                          │
-│                          │   S3 CRR     │                          │
-│  S3 (velero-primary)     │──────────►   │  S3 (velero-dr)          │
-│                          │              │                          │
-│  RDS                     │──snapshots►  │  RDS (restored)          │
-└──────────────────────────┘              └──────────────────────────┘
+.github/workflows/dr-drill.yml
+
+identify-backup ──► restore-drill ──► measure-rto
+     │                   │                │
+  Find latest        Restore app     Generate report
+  backup + assert    namespace in    + upload artifact
+  backup age < 25h   DR cluster      + post to Slack
+                     Validate
+                     Cleanup
 ```
 
-## RTO / RPO Targets
+## Triggers
 
-| Tier | RPO | RTO |
-|------|-----|-----|
-| Critical (prod) | 1 hour | 30 min |
-| Standard (staging) | 8 hours | 2 hours |
-| Dev | 24 hours | 4 hours |
+| Trigger | Schedule / Condition |
+|---------|----------------------|
+| Scheduled | Every Sunday 03:00 UTC |
+| Manual dispatch | Any time via GitHub Actions UI |
 
-## Quick Start
+### Manual Dispatch Inputs
 
-```bash
-# 1. Bootstrap primary region
-cd terraform/environments/primary
-terraform init && terraform apply
+| Input | Options | Default |
+|-------|---------|---------|
+| `environment` | `staging`, `prod` | `staging` |
+| `dry_run` | `true`, `false` | `true` |
 
-# 2. Bootstrap DR region
-cd terraform/environments/dr
-terraform init && terraform apply
+A dry run validates all steps (backup found, age within RPO) without performing an actual restore — safe to run at any time.
 
-# 3. Apply Velero Kubernetes manifests
-kubectl apply -f kubernetes/velero/
+## Jobs
 
-# 4. Trigger a manual DR drill
-.github/scripts/dr-drill/run-drill.sh --env staging --dry-run
-```
+### `identify-backup`
+- Connects to the primary EKS cluster
+- Lists all Velero backups and finds the most recent `Completed` one
+- Calculates backup age in hours
+- Fails the workflow if the backup is older than 25 hours (RPO breach)
+
+### `restore-drill`
+- Connects to the DR EKS cluster
+- Runs `scripts/restore/restore-namespace.sh` for the `app` namespace
+- Runs `scripts/restore/validate-restore.sh` (skipped in dry-run mode)
+- Cleans up the test restore after validation
+
+### `measure-rto`
+- Runs `scripts/dr-drill/generate-report.sh` to produce a markdown report
+- Uploads the report as a GitHub Actions artifact (retained 90 days)
+- Posts pass/fail summary to Slack (if `SLACK_WEBHOOK_URL` secret is set)
+
+## Required GitHub Secrets
+
+| Secret | Description |
+|--------|-------------|
+| `AWS_ACCESS_KEY_ID` | AWS access key |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret key |
+| `PRIMARY_CLUSTER_NAME` | EKS cluster name in `us-east-1` |
+| `DR_CLUSTER_NAME` | EKS cluster name in `us-west-2` |
+| `DR_APP_ENDPOINT` | ALB DNS for the DR cluster app (health check) |
+| `SLACK_WEBHOOK_URL` | Slack incoming webhook URL (optional) |
+
+## GitHub Environments
+
+The `restore-drill` job runs in the `dr-drill-staging` or `dr-drill-prod` environment. Configure protection rules in **GitHub → Settings → Environments** to require approval before a live drill runs against production.
+
+## Drill Report
+
+Each run produces `dr-drill-report.md` with:
+- RTO achieved (workflow duration in minutes)
+- RPO exposure (backup age at drill time)
+- Per-check pass/fail table
+- Link to the GitHub Actions run
+
+Reports are stored as workflow artifacts for 90 days for audit and trend tracking.
+
+## Running a Manual Dry Run
+
+1. Go to **Actions → DR Drill → Run workflow**
+2. Select `environment: staging`, `dry_run: true`
+3. Click **Run workflow**
+
+No resources will be created or modified in the DR cluster.
