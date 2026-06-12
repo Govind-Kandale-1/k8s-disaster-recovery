@@ -1,8 +1,8 @@
 terraform {
   required_providers {
-    aws        = { source = "hashicorp/aws",        version = "~> 5.0" }
-    kubernetes = { source = "hashicorp/kubernetes",  version = "~> 2.27" }
-    helm       = { source = "hashicorp/helm",        version = "~> 2.13" }
+    aws        = { source = "hashicorp/aws", version = "~> 5.0" }
+    kubernetes = { source = "hashicorp/kubernetes", version = "~> 2.27" }
+    helm       = { source = "hashicorp/helm", version = "~> 2.13" }
   }
 }
 
@@ -112,7 +112,7 @@ resource "aws_iam_role_policy" "velero" {
 
 resource "kubernetes_namespace" "velero" {
   metadata {
-    name = "velero"
+    name   = "velero"
     labels = { "app.kubernetes.io/managed-by" = "terraform" }
   }
 }
@@ -126,19 +126,58 @@ resource "helm_release" "velero" {
   version    = var.velero_version
   namespace  = kubernetes_namespace.velero.metadata[0].name
 
-  set { name = "image.tag";                   value = var.velero_image_tag }
-  set { name = "configuration.backupStorageLocation[0].provider"; value = "aws" }
-  set { name = "configuration.backupStorageLocation[0].bucket";   value = aws_s3_bucket.velero.id }
-  set { name = "configuration.backupStorageLocation[0].config.region"; value = var.aws_region }
-  set { name = "configuration.volumeSnapshotLocation[0].provider"; value = "aws" }
-  set { name = "configuration.volumeSnapshotLocation[0].config.region"; value = var.aws_region }
-  set { name = "serviceAccount.server.annotations.eks\\.amazonaws\\.com/role-arn"; value = aws_iam_role.velero.arn }
-  set { name = "initContainers[0].name";  value = "velero-plugin-for-aws" }
-  set { name = "initContainers[0].image"; value = "velero/velero-plugin-for-aws:v1.9.0" }
-  set { name = "initContainers[0].volumeMounts[0].mountPath"; value = "/target" }
-  set { name = "initContainers[0].volumeMounts[0].name";      value = "plugins" }
-  set { name = "metrics.enabled";         value = "true" }
-  set { name = "metrics.serviceMonitor.enabled"; value = "true" }
+  set {
+    name  = "image.tag"
+    value = var.velero_image_tag
+  }
+  set {
+    name  = "configuration.backupStorageLocation[0].provider"
+    value = "aws"
+  }
+  set {
+    name  = "configuration.backupStorageLocation[0].bucket"
+    value = aws_s3_bucket.velero.id
+  }
+  set {
+    name  = "configuration.backupStorageLocation[0].config.region"
+    value = var.aws_region
+  }
+  set {
+    name  = "configuration.volumeSnapshotLocation[0].provider"
+    value = "aws"
+  }
+  set {
+    name  = "configuration.volumeSnapshotLocation[0].config.region"
+    value = var.aws_region
+  }
+  set {
+    name  = "serviceAccount.server.annotations.eks\\.amazonaws\\.com/role-arn"
+    value = aws_iam_role.velero.arn
+  }
+  set {
+    name  = "initContainers[0].name"
+    value = "velero-plugin-for-aws"
+  }
+  set {
+    name  = "initContainers[0].image"
+    value = "velero/velero-plugin-for-aws:v1.9.0"
+  }
+  set {
+    name  = "initContainers[0].volumeMounts[0].mountPath"
+    value = "/target"
+  }
+  set {
+    name  = "initContainers[0].volumeMounts[0].name"
+    value = "plugins"
+  }
+  set {
+    name  = "metrics.enabled"
+    value = "true"
+  }
+  set {
+    name  = "metrics.serviceMonitor.enabled"
+    value = "true"
+  }
 
   depends_on = [kubernetes_namespace.velero]
 }
